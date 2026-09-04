@@ -51,6 +51,65 @@ class TestFlashAttentionRegistry(TestCase):
         ):
             attention.activate_flash_attention_impl("missing")
 
+    def test_activate_unknown_impl_keeps_current_impl(self):
+        """Asking for an unregistered impl must not deactivate the active one."""
+        removes: list[str] = []
+
+        class TrackedHandle:
+            def remove(self):
+                removes.append("removed")
+
+        attention.register_flash_attention_impl(
+            "GOOD", register_fn=lambda: TrackedHandle()
+        )
+        attention.activate_flash_attention_impl("GOOD")
+
+        with self.assertRaisesRegex(ValueError, "Unknown flash attention impl"):
+            attention.activate_flash_attention_impl("missing")
+
+        self.assertEqual("GOOD", attention.current_flash_attention_impl())
+        self.assertEqual([], removes)  # never torn down
+
+    def test_failed_activation_reactivates_previous_impl(self):
+        """A register_fn that raises (e.g. the provider package is not
+        installed) must leave the previously active impl active, not silently
+        drop the process to the default implementation."""
+        good_registrations: list[str] = []
+
+        class FakeGoodHandle:
+            def remove(self):
+                pass
+
+        def good_register():
+            good_registrations.append("registered")
+            return FakeGoodHandle()
+
+        def bad_register():
+            raise ImportError("provider package is not installed")
+
+        attention.register_flash_attention_impl("GOOD", register_fn=good_register)
+        attention.register_flash_attention_impl("BAD", register_fn=bad_register)
+
+        attention.activate_flash_attention_impl("GOOD")
+        self.assertEqual("GOOD", attention.current_flash_attention_impl())
+
+        with self.assertRaisesRegex(ImportError, "provider package"):
+            attention.activate_flash_attention_impl("BAD")
+
+        self.assertEqual("GOOD", attention.current_flash_attention_impl())
+        # GOOD was re-registered as part of the rollback
+        self.assertEqual(2, len(good_registrations))
+
+    def test_activation_without_handle_is_tracked(self):
+        """An impl whose register_fn returns no handle is still the current
+        impl, and restoring afterwards neither warns nor raises."""
+        attention.register_flash_attention_impl("NOHANDLE", register_fn=lambda: None)
+        attention.activate_flash_attention_impl("NOHANDLE")
+        self.assertEqual("NOHANDLE", attention.current_flash_attention_impl())
+
+        attention.restore_flash_attention_impl()
+        self.assertIsNone(attention.current_flash_attention_impl())
+
 
 if __name__ == "__main__":
     run_tests()

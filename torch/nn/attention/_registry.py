@@ -22,7 +22,7 @@ _FlashAttentionImpl = Literal["FA3", "FA4"]
 
 _FLASH_ATTENTION_IMPLS: dict[str, _RegisterFn] = {}
 
-_FLASH_ATTENTION_ACTIVE: tuple[str, FlashAttentionHandle] | None = None
+_FLASH_ATTENTION_ACTIVE: tuple[str, FlashAttentionHandle | None] | None = None
 
 
 def register_flash_attention_impl(
@@ -83,10 +83,8 @@ def activate_flash_attention_impl(
     """
     global _FLASH_ATTENTION_ACTIVE, _FLASH_ATTENTION_IMPLS
 
-    restore_flash_attention_impl(
-        _raise_warn=False
-    )  # first restore any prev overrides (if any) to default
-
+    # Validate BEFORE touching the currently active impl: a failed activation
+    # must not deactivate it.
     register_fn = _FLASH_ATTENTION_IMPLS.get(impl)
     if register_fn is None:
         raise ValueError(
@@ -94,9 +92,37 @@ def activate_flash_attention_impl(
             f"Available implementations: {list_flash_attention_impls()}"
         )
 
-    handle = register_fn()
-    if handle is not None:
-        _FLASH_ATTENTION_ACTIVE = (impl, handle)
+    prev = _FLASH_ATTENTION_ACTIVE
+    restore_flash_attention_impl(
+        _raise_warn=False
+    )  # first restore any prev overrides (if any) to default
+
+    try:
+        handle = register_fn()
+    except Exception:
+        # The provider's register_fn failed (e.g. its package is not
+        # installed). Reactivate the previously active impl so the failed
+        # activation is a no-op instead of silently dropping to the default.
+        if prev is not None:
+            prev_impl = prev[0]
+            prev_register_fn = _FLASH_ATTENTION_IMPLS.get(prev_impl)
+            if prev_register_fn is not None:
+                try:
+                    prev_handle = prev_register_fn()
+                    _FLASH_ATTENTION_ACTIVE = (prev_impl, prev_handle)
+                except Exception:
+                    logger.warning(
+                        "Failed to reactivate flash attention impl '%s' after "
+                        "activation of '%s' raised; falling back to the default.",
+                        prev_impl,
+                        impl,
+                    )
+        raise
+
+    # Track the active impl even when register_fn returns no handle, so
+    # current_flash_attention_impl() stays truthful and a later activation
+    # still restores through this entry.
+    _FLASH_ATTENTION_ACTIVE = (impl, handle)
 
 
 def list_flash_attention_impls() -> list[str]:
@@ -123,12 +149,10 @@ def restore_flash_attention_impl(_raise_warn: bool = True) -> None:
     """
     global _FLASH_ATTENTION_ACTIVE
 
-    handle = None
     if _FLASH_ATTENTION_ACTIVE is not None:
         handle = _FLASH_ATTENTION_ACTIVE[1]
-
-    if handle is not None:
-        handle.remove()
+        if handle is not None:
+            handle.remove()
     elif _raise_warn:
         logger.warning(
             "Trying to restore default FA2 impl when no custom impl was activated"

@@ -195,3 +195,7 @@ restore_flash_attention_impl.__module__ = __name__
 
 # Import built-in implementations to trigger self-registration
 from . import _fa3, _fa4
+
+# Honor TORCH_ATTENTION_IMPL now that the in-tree impls are registered.
+# An out-of-tree impl named here activates later, when it registers.
+_registry._activate_from_env()

@@ -6,6 +6,7 @@ It has no torch dependencies to avoid circular imports during initialization.
 """
 
 import logging
+import os
 from collections.abc import Callable
 from typing import Literal, Protocol
 
@@ -23,6 +24,13 @@ _FlashAttentionImpl = Literal["FA3", "FA4"]
 _FLASH_ATTENTION_IMPLS: dict[str, _RegisterFn] = {}
 
 _FLASH_ATTENTION_ACTIVE: tuple[str, FlashAttentionHandle | None] | None = None
+
+# Name of the impl requested via TORCH_ATTENTION_IMPL that is not registered
+# yet. Out-of-tree providers register on their own import, which happens after
+# torch.nn.attention is imported, so the request has to survive until then.
+_FLASH_ATTENTION_PENDING_ENV: str | None = None
+
+ENV_VAR = "TORCH_ATTENTION_IMPL"
 
 
 def register_flash_attention_impl(
@@ -54,8 +62,14 @@ def register_flash_attention_impl(
         ...     "MyImpl", register_fn=my_impl_register
         ... )  # doctest: +SKIP
     """
-    global _FLASH_ATTENTION_IMPLS
+    global _FLASH_ATTENTION_IMPLS, _FLASH_ATTENTION_PENDING_ENV
     _FLASH_ATTENTION_IMPLS[impl] = register_fn
+
+    # An impl named by TORCH_ATTENTION_IMPL before it was registered (the usual
+    # case for out-of-tree providers) activates as soon as it shows up.
+    if _FLASH_ATTENTION_PENDING_ENV == impl:
+        _FLASH_ATTENTION_PENDING_ENV = None
+        _activate_from_env_value(impl)
 
 
 def activate_flash_attention_impl(
@@ -159,3 +173,50 @@ def restore_flash_attention_impl(_raise_warn: bool = True) -> None:
         )
 
     _FLASH_ATTENTION_ACTIVE = None  # default
+
+
+def _activate_from_env_value(impl: str) -> None:
+    """Activate ``impl`` on behalf of the environment variable.
+
+    Environment-driven activation must never raise: the variable is process-wide
+    and typically set by a job launcher, so a stale or misspelled value must not
+    break ``import torch.nn.attention`` (nor an unrelated provider's import, via
+    the deferred path in :func:`register_flash_attention_impl`).
+    """
+    global _FLASH_ATTENTION_PENDING_ENV
+
+    try:
+        activate_flash_attention_impl(impl)
+    except Exception:
+        logger.warning(
+            "%s=%s: activation failed; leaving the default implementation active.",
+            ENV_VAR,
+            impl,
+            exc_info=True,
+        )
+        return
+    logger.info("%s=%s: activated.", ENV_VAR, impl)
+
+
+def _activate_from_env() -> None:
+    """Honor ``TORCH_ATTENTION_IMPL`` at ``torch.nn.attention`` import.
+
+    Lets an existing script run on a different attention implementation without
+    a source change, which is what makes A/B comparison and soak testing
+    practical.
+
+    Deferred by design: only in-tree impls are registered by the time this runs,
+    so an unknown name is remembered rather than rejected, and
+    :func:`register_flash_attention_impl` activates it when the provider is
+    imported. No module named by the variable is ever imported -- the user still
+    controls what gets loaded.
+    """
+    global _FLASH_ATTENTION_PENDING_ENV
+
+    impl = os.environ.get(ENV_VAR, "").strip()
+    if not impl:
+        return
+    if impl in _FLASH_ATTENTION_IMPLS:
+        _activate_from_env_value(impl)
+    else:
+        _FLASH_ATTENTION_PENDING_ENV = impl

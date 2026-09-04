@@ -1,5 +1,8 @@
 # Owner(s): ["module: sdpa"]
 
+import os
+from unittest import mock
+
 import torch.nn.attention as attention
 from torch.nn.attention import _registry
 from torch.testing._internal.common_utils import (
@@ -23,11 +26,14 @@ class TestFlashAttentionRegistry(TestCase):
         self._saved_active = attention.current_flash_attention_impl()
         _registry._FLASH_ATTENTION_IMPLS.clear()
         _registry._FLASH_ATTENTION_ACTIVE = None
+        self._saved_pending = _registry._FLASH_ATTENTION_PENDING_ENV
+        _registry._FLASH_ATTENTION_PENDING_ENV = None
 
     def tearDown(self):
         _registry._FLASH_ATTENTION_IMPLS.clear()
         _registry._FLASH_ATTENTION_IMPLS.update(self._saved_impls)
         _registry._FLASH_ATTENTION_ACTIVE = self._saved_active
+        _registry._FLASH_ATTENTION_PENDING_ENV = self._saved_pending
         super().tearDown()
 
     def test_register_and_activate_impl(self):
@@ -109,6 +115,59 @@ class TestFlashAttentionRegistry(TestCase):
 
         attention.restore_flash_attention_impl()
         self.assertIsNone(attention.current_flash_attention_impl())
+
+    def test_env_var_activates_registered_impl(self):
+        """TORCH_ATTENTION_IMPL names an impl that is already registered."""
+        attention.register_flash_attention_impl(
+            "ENVIMPL", register_fn=lambda: FakeHandle()
+        )
+        with mock.patch.dict(os.environ, {_registry.ENV_VAR: "ENVIMPL"}):
+            _registry._activate_from_env()
+        self.assertEqual("ENVIMPL", attention.current_flash_attention_impl())
+
+    def test_env_var_defers_until_impl_registers(self):
+        """An out-of-tree impl is not registered when torch.nn.attention is
+        imported, so the request waits for its registration."""
+        with mock.patch.dict(os.environ, {_registry.ENV_VAR: "LATEIMPL"}):
+            _registry._activate_from_env()
+        self.assertIsNone(attention.current_flash_attention_impl())
+        self.assertEqual("LATEIMPL", _registry._FLASH_ATTENTION_PENDING_ENV)
+
+        attention.register_flash_attention_impl(
+            "LATEIMPL", register_fn=lambda: FakeHandle()
+        )
+        self.assertEqual("LATEIMPL", attention.current_flash_attention_impl())
+        self.assertIsNone(_registry._FLASH_ATTENTION_PENDING_ENV)
+
+    def test_env_var_registration_of_other_impl_does_not_activate(self):
+        """Only the requested name activates; a different provider importing
+        first must not be hijacked by the pending request."""
+        with mock.patch.dict(os.environ, {_registry.ENV_VAR: "WANTED"}):
+            _registry._activate_from_env()
+        attention.register_flash_attention_impl(
+            "OTHER", register_fn=lambda: FakeHandle()
+        )
+        self.assertIsNone(attention.current_flash_attention_impl())
+        self.assertEqual("WANTED", _registry._FLASH_ATTENTION_PENDING_ENV)
+
+    def test_env_var_failed_activation_does_not_raise(self):
+        """A provider whose register_fn raises must not break the import that
+        triggered the deferred activation."""
+
+        def _boom():
+            raise RuntimeError("provider is broken")
+
+        with mock.patch.dict(os.environ, {_registry.ENV_VAR: "BROKEN"}):
+            _registry._activate_from_env()
+        attention.register_flash_attention_impl("BROKEN", register_fn=_boom)
+        self.assertIsNone(attention.current_flash_attention_impl())
+
+    def test_env_var_unset_or_blank_is_a_no_op(self):
+        for value in ("", "   "):
+            with mock.patch.dict(os.environ, {_registry.ENV_VAR: value}):
+                _registry._activate_from_env()
+            self.assertIsNone(attention.current_flash_attention_impl())
+            self.assertIsNone(_registry._FLASH_ATTENTION_PENDING_ENV)
 
 
 if __name__ == "__main__":
